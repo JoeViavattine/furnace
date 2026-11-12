@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# PlatformIO build output and editor settings
+.pio/
+.vscode/
+
+# Logged data (large; share selected examples later)
+data/
+
+# Secrets - never commit
+**/secrets.h
+*.env
