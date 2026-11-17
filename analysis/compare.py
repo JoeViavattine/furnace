@@ -24,7 +24,7 @@ sys.path.insert(0, str(HERE))
 from rawformat import read_bin
 from analyze import load_labels, pick_run, INK, MUTED, GRID
 
-SKIP_S = 2.0               # ignore this much either side of the mark
+SKIP_S = 3.0               # ignore this much either side of a mark (hand contact, speed settling)
 NPERSEG = 8192             # ~0.43 Hz bins
 SHAFT_RANGE = (15, 70)     # Hz, where to look for the 1x shaft peak
 BEFORE_C, AFTER_C = "#2a78d6", "#eb6834"
@@ -37,17 +37,23 @@ def spectrum(x, fs):
 
 
 def shaft_rate(f, tot):
-    """Coarse 1x from SHAFT_RANGE, then refined from the strongest order 16-32 (much finer)."""
-    band = (f > SHAFT_RANGE[0]) & (f < SHAFT_RANGE[1])
-    f0 = f[band][np.argmax(tot[band])]
-    best = (0, f0)
-    for k in range(16, 33):
-        sel = (f > k * f0 * 0.98) & (f < k * f0 * 1.02) & (f < f[-1])
-        if sel.any():
-            i = np.argmax(tot[sel])
-            if tot[sel][i] > best[0]:
-                best = (tot[sel][i], f[sel][i] / k)
-    return best[1]
+    """Shaft speed from the whole comb of blade-pass orders (4x, 8x, ... up to Nyquist).
+    Scoring every candidate speed against all orders at once is robust when a second
+    fan or a resonance makes one individual peak misleading. Resolution ~0.01 Hz."""
+    rel = 20 * np.log10(tot + 1e-12)
+    rel -= np.median(rel)                       # level above the noise floor, dB
+    df = f[1] - f[0]
+    best, best_score = None, -np.inf
+    for f0 in np.arange(SHAFT_RANGE[0], SHAFT_RANGE[1], 0.01):
+        ks = np.arange(4, int(f[-1] / f0) + 1, 4)
+        if len(ks) < 4:
+            continue
+        idx = np.round(ks * f0 / df).astype(int)
+        near = np.max([rel[np.clip(idx + s, 0, len(f) - 1)] for s in (-1, 0, 1)], axis=0)
+        score = near.mean()
+        if score > best_score:
+            best, best_score = f0, score
+    return best
 
 
 def order_amp(f, amp, f_target, tol=0.004):
@@ -74,8 +80,13 @@ def main():
         sys.exit("No mark found - press 'm' during logging at the moment of the change.")
     m = marks[which - 1][0]
     seg = next(s for s in segs if s[0] <= m < s[1])
+    # Window = from the previous boundary (segment start or earlier mark) to this mark,
+    # and from this mark to the next boundary (next mark or segment end).
+    marks_idx = sorted(i for i, _ in marks)
+    start = max([seg[0]] + [i for i in marks_idx if i < m])
+    end = min([seg[1]] + [i for i in marks_idx if i > m])
     skip = int(SKIP_S * fs)
-    a, b = xyz[seg[0] + skip : m - skip], xyz[m + skip : seg[1] - skip]
+    a, b = xyz[start + skip : m - skip], xyz[m + skip : end - skip]
     if min(len(a), len(b)) < NPERSEG * 2:
         sys.exit("Not enough steady data on one side of the mark (need ~5 s each side).")
 
