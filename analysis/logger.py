@@ -10,9 +10,12 @@ Keys while logging (edit LABEL_KEYS to suit):
 Output (in ../data):
     run_YYYYMMDD_HHMMSS.bin          exact byte stream from the Feather (lossless)
     run_YYYYMMDD_HHMMSS_labels.csv   sample_index, host_time, label
+    live.jsonl                       one line per second: time, fan speed, setting, RMS
+                                     (read by dashboard.py; shared across runs)
 """
 import argparse
 import csv
+import json
 import sys
 import time
 from datetime import datetime
@@ -23,6 +26,9 @@ import serial
 from serial.tools import list_ports
 
 from rawformat import PacketParser, SCALE, FLAG_OVERRUN, FLAG_I2C
+from features import estimate_speed, classify
+
+SPEED_BLOCK = 8192           # samples used for each speed estimate (~2.3 s at ~3.56 kHz)
 
 LABEL_KEYS = {"0": "off", "1": "low", "2": "medium", "3": "high", "4": "oscillate",
               "c": "coastdown", "m": "mark"}
@@ -102,6 +108,9 @@ def main():
     fs_ref = None              # (sample_index, unwrapped t_us) of first packet
     t_unwrap = last_t = None
     window = []                # samples since last status line
+    recent = []                # rolling raw samples for the speed estimate
+    n_recent = 0
+    live = open(out / "live.jsonl", "a", buffering=1)   # line-buffered: each line lands at once
     label = "start"
     t_status = time.time()
 
@@ -129,6 +138,10 @@ def main():
                         if fs_ref is None:
                             fs_ref = (total, t_unwrap)
                         window.append(xyz)
+                        recent.append(xyz)
+                        n_recent += n
+                        while n_recent - len(recent[0]) >= SPEED_BLOCK:
+                            n_recent -= len(recent.pop(0))
 
                 key = get_key()
                 if key == "q":
@@ -151,12 +164,27 @@ def main():
                         w = np.vstack(window) * SCALE
                         rms = float(np.sqrt((w.var(axis=0)).sum()))
                         window = []
+                    speed, setting = None, "UNKNOWN"
+                    if n_recent >= SPEED_BLOCK:
+                        blk = np.vstack(recent)[-SPEED_BLOCK:] * SCALE
+                        speed, _ = estimate_speed(blk, fs if fs > 3000 else 3558.0)
+                        setting = classify(speed, rms)
+                        if setting == "OFF":
+                            speed = None
+                    live.write(json.dumps({
+                        "t": round(time.time(), 2), "run": stem, "label": label,
+                        "setting": setting,
+                        "speed_hz": None if speed is None else round(speed, 2),
+                        "rms": round(rms, 4), "fs": round(fs, 1),
+                        "ok": not (overruns or dropped or i2c_errs)}) + "\n")
                     warn = []
                     if overruns: warn.append(f"OVERRUN x{overruns}")
                     if dropped: warn.append(f"DROPPED {dropped}")
                     if i2c_errs: warn.append(f"I2C ERR x{i2c_errs}")
                     if parser.bad_bytes: warn.append(f"bad bytes {parser.bad_bytes}")
+                    spd = f"{speed:5.2f} Hz" if speed else "  --   "
                     print(f"\r[{label:>9}] samples {total:>9,}  Fs {fs:7.1f} Hz  rms {rms:6.3f} m/s2  "
+                          f"fan {spd} {setting:<7} "
                           + ("  ".join(warn) if warn else "ok") + "      ", end="", flush=True)
                     fbin.flush()
         except KeyboardInterrupt:
@@ -164,6 +192,7 @@ def main():
         finally:
             keys_off()
             ser.close()
+            live.close()
 
     print(f"\n\nSaved {bin_path}\n      {lab_path}")
     print(f"{total:,} samples, overrun packets {overruns}, dropped {dropped}, "
