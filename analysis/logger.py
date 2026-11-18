@@ -113,6 +113,7 @@ def main():
     live = open(out / "live.jsonl", "a", buffering=1)   # line-buffered: each line lands at once
     label = "start"
     t_status = time.time()
+    settle_until = time.time() + 1.5   # ignore the stale burst the Feather queued before we connected
 
     with open(bin_path, "wb") as fbin, open(lab_path, "w", newline="") as flab:
         lab = csv.writer(flab)
@@ -135,6 +136,10 @@ def main():
                         t_unwrap = t_us if last_t is None else t_unwrap + ((t_us - last_t) % 2**32)
                         last_t = t_us
                         total += n
+                        if time.time() < settle_until:    # start-up: flush counters, re-anchor Fs
+                            dropped = overruns = i2c_errs = 0
+                            parser.bad_bytes = 0
+                            fs_ref = None
                         if fs_ref is None:
                             fs_ref = (total, t_unwrap)
                         window.append(xyz)
